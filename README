@@ -1,0 +1,23 @@
+Driver for SMART temperature sensors on ATA drives
+
+S.M.A.R.T. temperature sensors have been supported for years by userspace
+tools such as smarttools and hddtemp. This driver adds support to read
+the temperature directly from the kernel using the hwmon API and adds a
+temperature zone for each drive.
+
+With this driver, the hard disk temperature can be read using the
+unprivileged 'sensors' application:
+    
+$ sensors smarttemp-scsi-1-0
+smarttemp-scsi-1-0
+Adapter: SCSI adapter
+temp1:        +23.0°C
+    
+or directly from sysfs:
+    
+$ grep . /sys/class/hwmon/hwmon9/{name,temp1_input}
+/sys/class/hwmon/hwmon9/name:smarttemp
+/sys/class/hwmon/hwmon9/temp1_input:23000
+
+Note: 'sensors' has to be from the most recent version of the lm-sensors
+package.
