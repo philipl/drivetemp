@@ -35,6 +35,7 @@ static LIST_HEAD(smarttemp_devlist);
 #define ATA_MAX_SMART_ATTRS	30
 #define SMART_TEMP_PROP_190	190
 #define SMART_TEMP_PROP_194	194
+#define SMART_TEMP_PROP_231	231
 
 static int smarttemp_identify_ata(struct scsi_device *sdev)
 {
@@ -95,7 +96,8 @@ static int smarttemp_read_temp(struct smarttemp_data *st, long *temp)
 		if (!id)
 			continue;
 
-		if (id == SMART_TEMP_PROP_190 || id == SMART_TEMP_PROP_194) {
+		if (id == SMART_TEMP_PROP_190 || id == SMART_TEMP_PROP_194 ||
+		    id == SMART_TEMP_PROP_231) {
 			*temp = attr[7] * 1000;
 			return 0;
 		}
