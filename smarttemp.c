@@ -9,6 +9,72 @@
  *
  *    hwmon: Driver for SCSI/ATA temperature sensors
  *    by Constantin Baranov <const@mimas.ru>, submitted September 2009
+ *
+ * There are three SMART attributes reporting drive temperatures.
+ * Those are defined as follows (from
+ * http://www.cropel.com/library/smart-attribute-list.aspx).
+ *
+ * 190	Temperature	Temperature, monitored by a sensor somewhere inside
+ * 			the drive. Raw value typicaly holds the actual
+ * 			temperature (hexadecimal) in its rightmost two digits.
+ *
+ * 194	Temperature	Temperature, monitored by a sensor somewhere inside
+ * 			the drive. Raw value typicaly holds the actual
+ * 			temperature (hexadecimal) in its rightmost two digits.
+ *
+ * 231	Temperature	Temperature, monitored by a sensor somewhere inside
+ * 			the drive. Raw value typicaly holds the actual
+ * 			temperature (hexadecimal) in its rightmost two digits.
+ *
+ * Wikipedia defines attributes a bit differently.
+ *
+ * 190	Temperature	Value is equal to (100-temp. °C), allowing manufacturer
+ *	Difference or	to set a minimum threshold which corresponds to a
+ *	Airflow		maximum temperature. This also follows the convention of
+ *	Temperature	100 being a best-case value and lower values being
+ *			undesirable. However, some older drives may instead
+ *			report raw Temperature (identical to 0xC2) or
+ *			Temperature minus 50 here.
+ * 194	Temperature or	Indicates the device temperature, if the appropriate
+ *	Temperature	sensor is fitted. Lowest byte of the raw value contains
+ *	Celsius		the exact temperature value (Celsius degrees).
+ * 231	Life Left	Indicates the approximate SSD life left, in terms of
+ *	(SSDs) or	program/erase cycles or available reserved blocks.
+ *	Temperature	A normalized value of 100 represents a new drive, with
+ *			a threshold value at 10 indicating a need for
+ *			replacement. A value of 0 may mean that the drive is
+ *			operating in read-only mode to allow data recovery.
+ *			Previously (pre-2010) occasionally used for Drive
+ *			Temperature (more typically reported at 0xC2).
+ *
+ * Common denominator is that the first raw byte reports the temperature
+ * in degrees C on almost all drives. Some drives may report a fractional
+ * temperature in the second raw byte.
+ *
+ * Known exceptions (from libatasmart):
+ * - SAMSUNG SV0412H and SAMSUNG SV1204H) report the temperature in 10th
+ *   degrees C in the first two raw bytes.
+ * - A few Maxtor drives report an unknown or bad value in attribute 194.
+ * - Certain Apple SSD drives report an unknown value in attribute 190.
+ *   Only certain firmware versions are affected.
+ *
+ * Those exceptions affect older ATA drives and are currently ignored.
+ * Also, the second raw byte (possibly reporting the fractional temperature)
+ * is currently ignored.
+ *
+ * Many drives also report temperature limits in additional raw bytes.
+ * The format of those is not well defined and varies widely. The driver
+ * does not currently attempt to report those limits.
+ *
+ * According to data in smartmontools, attribute 231 is rarely used to report
+ * drive temperatures. At the same time, several drives report SSD life left
+ * in attribute 231, but do not support temperature sensors. For this reason,
+ * attribute 231 is currently ignored.
+ *
+ * Following above definitions, temperatures are reported as follows.
+ * - If attribute 194 is supported, it is used to read the temperature.
+ * - If attribute 194 is not supported, attribute 190 is used to read the
+ *   temperature if it is supported.
  */
 
 #include <linux/ata.h>
@@ -35,7 +101,6 @@ static LIST_HEAD(smarttemp_devlist);
 #define ATA_MAX_SMART_ATTRS	30
 #define SMART_TEMP_PROP_190	190
 #define SMART_TEMP_PROP_194	194
-#define SMART_TEMP_PROP_231	231
 
 static int smarttemp_identify_ata(struct scsi_device *sdev)
 {
@@ -54,8 +119,10 @@ static int smarttemp_read_temp(struct smarttemp_data *st, long *temp)
 {
 	static u8 scsi_cmd[MAX_COMMAND_SIZE];
 	u8 *buf = st->smartdata;
+	bool have_temp = false;
 	int resid, err;
 	int nattrs, i;
+	u8 temp_raw;
 	u8 csum;
 
 	/* ATA command to read SMART values */
@@ -96,11 +163,20 @@ static int smarttemp_read_temp(struct smarttemp_data *st, long *temp)
 		if (!id)
 			continue;
 
-		if (id == SMART_TEMP_PROP_190 || id == SMART_TEMP_PROP_194 ||
-		    id == SMART_TEMP_PROP_231) {
-			*temp = attr[7] * 1000;
-			return 0;
+		if (id == SMART_TEMP_PROP_190) {
+			temp_raw = attr[7];
+			have_temp = true;
 		}
+		if (id == SMART_TEMP_PROP_194) {
+			temp_raw = attr[7];
+			have_temp = true;
+			break;
+		}
+	}
+
+	if (have_temp) {
+		*temp = temp_raw * 1000;
+		return 0;
 	}
 
 	return -ENXIO;
