@@ -1,0 +1,11 @@
+- Some drives report temperatures in 10th of a degree Celsius.
+  In that case, the second byte of raw data is relevant. 
+  This is known to affect SAMSUNG SV0412H and SAMSUNG SV1204H.
+  Those are 40GB and 120GB Ultra-ATA drives; maybe it is irrelevant
+  enough not to care.
+- On some drives, the content of attribute a90 and/or 194 appears
+  to be unknown to be unreliable or unknown. This affects drives
+  from Apple (190) Maxtor (194). See libatasmart for details.
+  The Apple drive is a SSD; the bug against it was opened in 2009.
+  Maxtor drives are old Ultra-ATA drives. Maybe those are irrelevant
+  as well.
