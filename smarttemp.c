@@ -26,16 +26,16 @@
  * http://www.cropel.com/library/smart-attribute-list.aspx).
  *
  * 190	Temperature	Temperature, monitored by a sensor somewhere inside
- * 			the drive. Raw value typicaly holds the actual
- * 			temperature (hexadecimal) in its rightmost two digits.
+ *			the drive. Raw value typicaly holds the actual
+ *			temperature (hexadecimal) in its rightmost two digits.
  *
  * 194	Temperature	Temperature, monitored by a sensor somewhere inside
- * 			the drive. Raw value typicaly holds the actual
- * 			temperature (hexadecimal) in its rightmost two digits.
+ *			the drive. Raw value typicaly holds the actual
+ *			temperature (hexadecimal) in its rightmost two digits.
  *
  * 231	Temperature	Temperature, monitored by a sensor somewhere inside
- * 			the drive. Raw value typicaly holds the actual
- * 			temperature (hexadecimal) in its rightmost two digits.
+ *			the drive. Raw value typicaly holds the actual
+ *			temperature (hexadecimal) in its rightmost two digits.
  *
  * Wikipedia defines attributes a bit differently.
  *
