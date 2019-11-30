@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Hwmon client for S.M.A.R.T. hard disk drives with temperature sensors
+ * Hwmon client for ATA/SATA hard disk drives with temperature sensors
  * (c) 2019 Guenter Roeck
  *
  * Derived from:
@@ -10,7 +10,18 @@
  *    hwmon: Driver for SCSI/ATA temperature sensors
  *    by Constantin Baranov <const@mimas.ru>, submitted September 2009
  *
- * There are three SMART attributes reporting drive temperatures.
+ * The primary means to read hard drive temperatures and temperature limits
+ * is the SCT Command Transport feature set as specified in ATA8-ACS.
+ * It can be used to read the current drive temperature, temperature limits,
+ * and historic minimum and maximum temperatures. The SCT Command Transport
+ * feature set is documented in "AT Attachment 8 - ATA/ATAPI Command Set
+ * (ATA8-ACS)".
+ *
+ * If the SCT Command Transport feature set is not available, drive temperatures
+ * may be readable through SMART attributes. Since SMART attributes are not well
+ * defined, this method is only used as fallback mechanism.
+ *
+ * There are three SMART attributes which may report drive temperatures.
  * Those are defined as follows (from
  * http://www.cropel.com/library/smart-attribute-list.aspx).
  *
@@ -78,6 +89,7 @@
  */
 
 #include <linux/ata.h>
+#include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/hwmon.h>
 #include <linux/kernel.h>
@@ -94,6 +106,17 @@ struct smarttemp_data {
 	struct device *dev;		/* instantiating device */
 	struct device *hwdev;		/* hardware monitoring device */
 	u8 smartdata[ATA_SECT_SIZE];	/* local buffer */
+	bool have_sct_temp;		/* reading temperature w/ SCT status */
+	bool have_temp_lowest;		/* lowest temp in SCT status */
+	bool have_temp_highest;		/* highest temp in SCT status */
+	bool have_temp_min;		/* have min temp */
+	bool have_temp_max;		/* have max temp */
+	bool have_temp_lcrit;		/* have lower critical limit */
+	bool have_temp_crit;		/* have critical limit */
+	int temp_min;			/* min temp */
+	int temp_max;			/* max temp */
+	int temp_lcrit;			/* lower critical limit */
+	int temp_crit;			/* critical limit */
 };
 
 static LIST_HEAD(smarttemp_devlist);
@@ -101,6 +124,19 @@ static LIST_HEAD(smarttemp_devlist);
 #define ATA_MAX_SMART_ATTRS	30
 #define SMART_TEMP_PROP_190	190
 #define SMART_TEMP_PROP_194	194
+
+#define ATA_IDENTIFY_DEVICE	0xec
+#define  IDENTIFY_SCT_TRANSPORT		(206 * 2)
+#define SCT_STATUS_REQ		0xe0
+#define  SMART_READ_LOG		0xd5
+#define  SMART_WRITE_LOG	0xd6
+#define  SCT_STATUS_VERSION_LOW	0	/* log byte offsets */
+#define  SCT_STATUS_VERSION_HIGH	1
+#define  SCT_STATUS_TEMP		200
+#define  SCT_STATUS_TEMP_LOWEST		201
+#define  SCT_STATUS_TEMP_HIGHEST	202
+
+#define INVALID_TEMP			0x80
 
 static int smarttemp_identify_ata(struct scsi_device *sdev)
 {
@@ -115,34 +151,62 @@ static int smarttemp_identify_ata(struct scsi_device *sdev)
 	return 0;
 }
 
-static int smarttemp_read_temp(struct smarttemp_data *st, long *temp)
+static int smarttemp_scsi_command(struct smarttemp_data *st, u8 ata_command,
+				  u8 feature,
+				  u8 lba_low, u8 lba_mid, u8 lba_high)
 {
 	static u8 scsi_cmd[MAX_COMMAND_SIZE];
+	int data_dir;
+
+	/* ATA command */
+	memset(scsi_cmd, 0, sizeof(scsi_cmd));
+	scsi_cmd[0] = ATA_16;
+	if (feature == SMART_WRITE_LOG) {
+		scsi_cmd[1] = (5 << 1); /* PIO Data-out */
+		/*
+		 * No off.line or cc, write to dev, block count in sector count
+		 * field.
+		 */
+		scsi_cmd[2] = 0x06;
+		data_dir = DMA_TO_DEVICE;
+	} else {
+		scsi_cmd[1] = (4 << 1); /* PIO Data-in */
+		/*
+		 * No off.line or cc, read from dev, block count in sector count
+		 * field.
+		 */
+		scsi_cmd[2] = 0x0e;
+		data_dir = DMA_FROM_DEVICE;
+	}
+	scsi_cmd[4] = feature;
+	scsi_cmd[6] = 1; /* 1 sector */
+	scsi_cmd[8] = lba_low;
+	scsi_cmd[10] = lba_mid;
+	scsi_cmd[12] = lba_high;
+	scsi_cmd[14] = ata_command;
+
+	return scsi_execute_req(st->sdev, scsi_cmd, data_dir,
+				st->smartdata, ATA_SECT_SIZE, NULL, HZ, 5,
+				NULL);
+}
+
+static int smarttemp_ata_command(struct smarttemp_data *st, u8 feature,
+				 u8 select)
+{
+	return smarttemp_scsi_command(st, ATA_CMD_SMART, feature, select,
+				      ATA_SMART_LBAM_PASS, ATA_SMART_LBAH_PASS);
+}
+
+static int smarttemp_read_smarttemp(struct smarttemp_data *st, long *temp)
+{
 	u8 *buf = st->smartdata;
 	bool have_temp = false;
-	int resid, err;
 	int nattrs, i;
 	u8 temp_raw;
 	u8 csum;
+	int err;
 
-	/* ATA command to read SMART values */
-	memset(scsi_cmd, 0, sizeof(scsi_cmd));
-	scsi_cmd[0] = ATA_16;
-	scsi_cmd[1] = (4 << 1); /* PIO Data-in */
-	/*
-	 * No off.line or cc, read from dev, block count in sector count
-	 * field.
-	 */
-	scsi_cmd[2] = 0x0e;
-	scsi_cmd[4] = ATA_SMART_READ_VALUES;
-	scsi_cmd[6] = 1; /* 1 sector */
-	scsi_cmd[8] = 0; /* args[1]; */
-	scsi_cmd[10] = ATA_SMART_LBAM_PASS;
-	scsi_cmd[12] = ATA_SMART_LBAH_PASS;
-	scsi_cmd[14] = ATA_CMD_SMART;
-
-	err = scsi_execute_req(st->sdev, scsi_cmd, DMA_FROM_DEVICE,
-			       buf, ATA_SECT_SIZE, NULL, HZ, 5, &resid);
+	err = smarttemp_ata_command(st, ATA_SMART_READ_VALUES, 0);
 	if (err)
 		return err;
 
@@ -151,11 +215,12 @@ static int smarttemp_read_temp(struct smarttemp_data *st, long *temp)
 	for (i = 0; i < ATA_SECT_SIZE; i++)
 		csum += buf[i];
 	if (csum) {
-		dev_dbg(&st->sdev->sdev_gendev, "checksum error reading SMART values\n");
+		dev_dbg(&st->sdev->sdev_gendev,
+			"checksum error reading SMART values\n");
 		return -EIO;
 	}
 
-	nattrs = min_t(int, ATA_MAX_SMART_ATTRS, (ATA_SECT_SIZE - resid) / 12);
+	nattrs = min_t(int, ATA_MAX_SMART_ATTRS, ATA_SECT_SIZE / 12);
 	for (i = 0; i < nattrs; i++) {
 		u8 *attr = buf + i * 12;
 		int id = attr[2];
@@ -182,6 +247,109 @@ static int smarttemp_read_temp(struct smarttemp_data *st, long *temp)
 	return -ENXIO;
 }
 
+static int smarttemp_identify_features(struct smarttemp_data *st)
+{
+	u8 *buf = st->smartdata;
+	bool have_sct_data_table;
+	bool have_sct_status;
+	u16 version;
+	long temp;
+	int err;
+
+	err = smarttemp_scsi_command(st, ATA_IDENTIFY_DEVICE, 0, 0, 0, 0);
+	if (err)
+		goto skip_sct;
+
+	have_sct_data_table = buf[IDENTIFY_SCT_TRANSPORT] & BIT(5);
+	have_sct_status = buf[IDENTIFY_SCT_TRANSPORT] & BIT(0);
+
+	if (!have_sct_status)
+		goto skip_sct_status;
+
+	err = smarttemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ);
+	if (err)
+		goto skip_sct_status;
+
+	version = (buf[SCT_STATUS_VERSION_HIGH] << 8) |
+		  buf[SCT_STATUS_VERSION_LOW];
+	if (version != 2 && version != 3)
+		goto skip_sct_status;
+
+	st->have_sct_temp = buf[SCT_STATUS_TEMP] != INVALID_TEMP;
+	if (!st->have_sct_temp)
+		goto skip_sct_status;
+
+	st->have_temp_lowest = buf[SCT_STATUS_TEMP_LOWEST] != INVALID_TEMP;
+	st->have_temp_highest = buf[SCT_STATUS_TEMP_HIGHEST] != INVALID_TEMP;
+
+skip_sct_status:
+	if (!have_sct_data_table)
+		goto skip_sct;
+
+	/* Request and read temperature history table */
+	memset(buf, '\0', sizeof(st->smartdata));
+	buf[0] = 5;	/* data table command */
+	buf[2] = 1;	/* read table */
+	buf[4] = 2;	/* temperature history table */
+
+	err = smarttemp_ata_command(st, SMART_WRITE_LOG, SCT_STATUS_REQ);
+	if (err)
+		goto skip_sct_data;
+
+	err = smarttemp_ata_command(st, SMART_READ_LOG, 0xe1);
+	if (err)
+		goto skip_sct_data;
+
+	/* Temperature limits per AT Attachment 8 -
+	 * ATA/ATAPI Command Set (ATA8-ACS)
+	 */
+	st->have_temp_max = buf[6] != INVALID_TEMP;
+	st->have_temp_crit = buf[7] != INVALID_TEMP;
+	st->have_temp_min = buf[8] != INVALID_TEMP;
+	st->have_temp_lcrit = buf[9] != INVALID_TEMP;
+
+	st->temp_max = ((s8)buf[6]) * 1000;
+	st->temp_crit = ((s8)buf[7]) * 1000;
+	st->temp_min = ((s8)buf[8]) * 1000;
+	st->temp_lcrit = ((s8)buf[9]) * 1000;
+
+skip_sct_data:
+	if (st->have_sct_temp)
+		return 0;
+skip_sct:
+	return smarttemp_read_smarttemp(st, &temp);
+}
+
+static int smarttemp_read_temp(struct smarttemp_data *st, u32 attr,
+			       long *val)
+{
+	u8 *buf = st->smartdata;
+	int err;
+
+	if (st->have_sct_temp) {
+		err = smarttemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ);
+		if (err)
+			return err;
+		switch (attr) {
+		case hwmon_temp_input:
+			*val = ((char)buf[SCT_STATUS_TEMP]) * 1000;
+			break;
+		case hwmon_temp_lowest:
+			*val = ((char)buf[SCT_STATUS_TEMP_LOWEST] * 1000);
+			break;
+		case hwmon_temp_highest:
+			*val = ((char)buf[SCT_STATUS_TEMP_HIGHEST]) * 1000;
+			break;
+		default:
+			err = -EINVAL;
+			break;
+		}
+		return err;
+	}
+
+	return smarttemp_read_smarttemp(st, val);
+}
+
 static int smarttemp_read(struct device *dev, enum hwmon_sensor_types type,
 			  u32 attr, int channel, long *val)
 {
@@ -193,10 +361,22 @@ static int smarttemp_read(struct device *dev, enum hwmon_sensor_types type,
 
 	switch (attr) {
 	case hwmon_temp_input:
-		err = smarttemp_read_temp(st, val);
+	case hwmon_temp_lowest:
+	case hwmon_temp_highest:
+		err = smarttemp_read_temp(st, attr, val);
+		break;
+	case hwmon_temp_lcrit:
+		*val = st->temp_lcrit;
+		break;
+	case hwmon_temp_min:
+		*val = st->temp_min;
 		break;
 	case hwmon_temp_max:
-	case hwmon_temp_min:
+		*val = st->temp_max;
+		break;
+	case hwmon_temp_crit:
+		*val = st->temp_crit;
+		break;
 	default:
 		err = -EINVAL;
 		break;
@@ -208,11 +388,37 @@ static umode_t smarttemp_is_visible(const void *data,
 				    enum hwmon_sensor_types type,
 				    u32 attr, int channel)
 {
+	const struct smarttemp_data *st = data;
+
 	switch (type) {
 	case hwmon_temp:
 		switch (attr) {
 		case hwmon_temp_input:
 			return 0444;
+		case hwmon_temp_lowest:
+			if (st->have_temp_lowest)
+				return 0444;
+			break;
+		case hwmon_temp_highest:
+			if (st->have_temp_highest)
+				return 0444;
+			break;
+		case hwmon_temp_min:
+			if (st->have_temp_min)
+				return 0444;
+			break;
+		case hwmon_temp_max:
+			if (st->have_temp_max)
+				return 0444;
+			break;
+		case hwmon_temp_lcrit:
+			if (st->have_temp_lcrit)
+				return 0444;
+			break;
+		case hwmon_temp_crit:
+			if (st->have_temp_crit)
+				return 0444;
+			break;
 		default:
 			break;
 		}
@@ -226,7 +432,10 @@ static umode_t smarttemp_is_visible(const void *data,
 static const struct hwmon_channel_info *smarttemp_info[] = {
 	HWMON_CHANNEL_INFO(chip,
 			   HWMON_C_REGISTER_TZ),
-	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT),
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT |
+			   HWMON_T_LOWEST | HWMON_T_HIGHEST |
+			   HWMON_T_MIN | HWMON_T_MAX |
+			   HWMON_T_LCRIT | HWMON_T_CRIT),
 	NULL
 };
 
@@ -248,7 +457,6 @@ static int smarttemp_add(struct device *dev, struct class_interface *intf)
 {
 	struct scsi_device *sdev = to_scsi_device(dev->parent);
 	struct smarttemp_data *st;
-	long temp;
 	int err;
 
 	/* Bail out immediately if this is not an ATA device */
@@ -263,8 +471,7 @@ static int smarttemp_add(struct device *dev, struct class_interface *intf)
 	st->sdev = sdev;
 	st->dev = dev;
 
-	/* If reading the sensor fails, assume we don't have one and bail out */
-	if (smarttemp_read_temp(st, &temp)) {
+	if (smarttemp_identify_features(st)) {
 		err = -ENODEV;
 		goto abort;
 	}
