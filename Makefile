@@ -23,7 +23,7 @@ else
 SYSTEM_MAP      := /proc/kallsyms
 endif
 
-DRIVER := smarttemp
+DRIVER := satatemp
 
 # Directory below /lib/modules/$(TARGET)/kernel into which to install
 # the module:

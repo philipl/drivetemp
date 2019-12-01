@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Hwmon client for ATA/SATA hard disk drives with temperature sensors
+ * Hwmon client for SATA hard disk drives with temperature sensors
  * (c) 2019 Guenter Roeck
  *
  * Derived from:
@@ -89,7 +89,6 @@
  */
 
 #include <linux/ata.h>
-#include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/hwmon.h>
 #include <linux/kernel.h>
@@ -100,13 +99,13 @@
 #include <scsi/scsi_driver.h>
 #include <scsi/scsi_proto.h>
 
-struct smarttemp_data {
+struct satatemp_data {
 	struct list_head list;		/* list of instantiated devices */
 	struct scsi_device *sdev;	/* SCSI device */
 	struct device *dev;		/* instantiating device */
 	struct device *hwdev;		/* hardware monitoring device */
 	u8 smartdata[ATA_SECT_SIZE];	/* local buffer */
-	bool have_sct_temp;		/* reading temperature w/ SCT status */
+	int (*get_temp)(struct satatemp_data *st, u32 attr, long *val);
 	bool have_temp_lowest;		/* lowest temp in SCT status */
 	bool have_temp_highest;		/* highest temp in SCT status */
 	bool have_temp_min;		/* have min temp */
@@ -119,50 +118,35 @@ struct smarttemp_data {
 	int temp_crit;			/* critical limit */
 };
 
-static LIST_HEAD(smarttemp_devlist);
+static LIST_HEAD(satatemp_devlist);
 
 #define ATA_MAX_SMART_ATTRS	30
 #define SMART_TEMP_PROP_190	190
 #define SMART_TEMP_PROP_194	194
 
-#define ATA_IDENTIFY_DEVICE	0xec
-#define  IDENTIFY_SCT_TRANSPORT		(206 * 2)
-#define SCT_STATUS_REQ		0xe0
-#define  SMART_READ_LOG		0xd5
-#define  SMART_WRITE_LOG	0xd6
-#define  SCT_STATUS_VERSION_LOW	0	/* log byte offsets */
+#define SCT_STATUS_REQ_ADDR	0xe0
+#define  SCT_STATUS_VERSION_LOW		0	/* log byte offsets */
 #define  SCT_STATUS_VERSION_HIGH	1
 #define  SCT_STATUS_TEMP		200
 #define  SCT_STATUS_TEMP_LOWEST		201
 #define  SCT_STATUS_TEMP_HIGHEST	202
+#define SCT_READ_LOG_ADDR	0xe1
+#define  SMART_READ_LOG			0xd5
+#define  SMART_WRITE_LOG		0xd6
 
-#define INVALID_TEMP			0x80
+#define INVALID_TEMP		0x80
 
-static int smarttemp_identify_ata(struct scsi_device *sdev)
-{
-	/* Use cached SCSI inquiry response to identify ATA devices */
-	if (!sdev->inquiry || sdev->inquiry_len < 16)
-		return -ENODEV;
-
-	/* libata reports the SCSI Vendor ID as "ATA" */
-	if (strncmp(&sdev->inquiry[8], "ATA     ", 8))
-		return -ENODEV;
-
-	return 0;
-}
-
-static int smarttemp_scsi_command(struct smarttemp_data *st, u8 ata_command,
-				  u8 feature,
-				  u8 lba_low, u8 lba_mid, u8 lba_high)
+static int satatemp_scsi_command(struct satatemp_data *st,
+				 u8 ata_command, u8 feature,
+				 u8 lba_low, u8 lba_mid, u8 lba_high)
 {
 	static u8 scsi_cmd[MAX_COMMAND_SIZE];
 	int data_dir;
 
-	/* ATA command */
 	memset(scsi_cmd, 0, sizeof(scsi_cmd));
 	scsi_cmd[0] = ATA_16;
-	if (feature == SMART_WRITE_LOG) {
-		scsi_cmd[1] = (5 << 1); /* PIO Data-out */
+	if (ata_command == ATA_CMD_SMART && feature == SMART_WRITE_LOG) {
+		scsi_cmd[1] = (5 << 1);	/* PIO Data-out */
 		/*
 		 * No off.line or cc, write to dev, block count in sector count
 		 * field.
@@ -170,7 +154,7 @@ static int smarttemp_scsi_command(struct smarttemp_data *st, u8 ata_command,
 		scsi_cmd[2] = 0x06;
 		data_dir = DMA_TO_DEVICE;
 	} else {
-		scsi_cmd[1] = (4 << 1); /* PIO Data-in */
+		scsi_cmd[1] = (4 << 1);	/* PIO Data-in */
 		/*
 		 * No off.line or cc, read from dev, block count in sector count
 		 * field.
@@ -179,7 +163,7 @@ static int smarttemp_scsi_command(struct smarttemp_data *st, u8 ata_command,
 		data_dir = DMA_FROM_DEVICE;
 	}
 	scsi_cmd[4] = feature;
-	scsi_cmd[6] = 1; /* 1 sector */
+	scsi_cmd[6] = 1;	/* 1 sector */
 	scsi_cmd[8] = lba_low;
 	scsi_cmd[10] = lba_mid;
 	scsi_cmd[12] = lba_high;
@@ -190,14 +174,14 @@ static int smarttemp_scsi_command(struct smarttemp_data *st, u8 ata_command,
 				NULL);
 }
 
-static int smarttemp_ata_command(struct smarttemp_data *st, u8 feature,
-				 u8 select)
+static int satatemp_ata_command(struct satatemp_data *st, u8 feature, u8 select)
 {
-	return smarttemp_scsi_command(st, ATA_CMD_SMART, feature, select,
-				      ATA_SMART_LBAM_PASS, ATA_SMART_LBAH_PASS);
+	return satatemp_scsi_command(st, ATA_CMD_SMART, feature, select,
+				     ATA_SMART_LBAM_PASS, ATA_SMART_LBAH_PASS);
 }
 
-static int smarttemp_read_smarttemp(struct smarttemp_data *st, long *temp)
+static int satatemp_get_smarttemp(struct satatemp_data *st, u32 attr,
+				  long *temp)
 {
 	u8 *buf = st->smartdata;
 	bool have_temp = false;
@@ -206,7 +190,7 @@ static int smarttemp_read_smarttemp(struct smarttemp_data *st, long *temp)
 	u8 csum;
 	int err;
 
-	err = smarttemp_ata_command(st, ATA_SMART_READ_VALUES, 0);
+	err = satatemp_ata_command(st, ATA_SMART_READ_VALUES, 0);
 	if (err)
 		return err;
 
@@ -247,42 +231,99 @@ static int smarttemp_read_smarttemp(struct smarttemp_data *st, long *temp)
 	return -ENXIO;
 }
 
-static int smarttemp_identify_features(struct smarttemp_data *st)
+static int satatemp_get_scttemp(struct satatemp_data *st, u32 attr, long *val)
 {
 	u8 *buf = st->smartdata;
-	bool have_sct_data_table;
-	bool have_sct_status;
-	u16 version;
-	long temp;
 	int err;
 
-	err = smarttemp_scsi_command(st, ATA_IDENTIFY_DEVICE, 0, 0, 0, 0);
+	err = satatemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ_ADDR);
 	if (err)
+		return err;
+	switch (attr) {
+	case hwmon_temp_input:
+		*val = ((char)buf[SCT_STATUS_TEMP]) * 1000;
+		break;
+	case hwmon_temp_lowest:
+		*val = ((char)buf[SCT_STATUS_TEMP_LOWEST] * 1000);
+		break;
+	case hwmon_temp_highest:
+		*val = ((char)buf[SCT_STATUS_TEMP_HIGHEST]) * 1000;
+		break;
+	default:
+		err = -EINVAL;
+		break;
+	}
+	return err;
+}
+
+static int satatemp_identify(struct satatemp_data *st)
+{
+	struct scsi_device *sdev = st->sdev;
+	u8 *buf = st->smartdata;
+	bool is_ata, is_sata;
+	bool have_sct_data_table;
+	bool have_sct_temp;
+	bool have_sct;
+	u16 *ata_id;
+	u16 version;
+	long temp;
+	u8 *vpd;
+	int err;
+
+	/* bail out if there is no inquiry data */
+	if (!sdev->inquiry || sdev->inquiry_len < 16)
+		return -ENODEV;
+
+	/* sanity check: libata reports the SCSI Vendor ID as "ATA" */
+	if (strncmp(&sdev->inquiry[8], "ATA     ", 8))
+		return -ENODEV;
+
+	vpd = kzalloc(1024, GFP_KERNEL);
+	if (!vpd)
+		return -ENOMEM;
+
+	err = scsi_get_vpd_page(sdev, 0x89, vpd, 1024);
+	if (err) {
+		kfree(vpd);
+		return err;
+	}
+
+	/* more sanity checks */
+	if (strncmp(&vpd[8], "linux   libata          ", 24) ||
+	    vpd[56] != ATA_CMD_ID_ATA) {
+		kfree(vpd);
+		return -ENODEV;
+	}
+	ata_id = (u16 *)&vpd[60];
+	is_ata = ata_id_is_ata(ata_id);
+	is_sata = ata_id_is_sata(ata_id);
+	have_sct = ata_id_sct_supported(ata_id);
+	have_sct_data_table = ata_id_sct_data_tables(ata_id);
+
+	kfree(vpd);
+
+	/* bail out if this is not a SATA device */
+	if (!is_ata || !is_sata)
+		return -ENODEV;
+	if (!have_sct)
 		goto skip_sct;
 
-	have_sct_data_table = buf[IDENTIFY_SCT_TRANSPORT] & BIT(5);
-	have_sct_status = buf[IDENTIFY_SCT_TRANSPORT] & BIT(0);
-
-	if (!have_sct_status)
-		goto skip_sct_status;
-
-	err = smarttemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ);
+	err = satatemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ_ADDR);
 	if (err)
-		goto skip_sct_status;
+		goto skip_sct;
 
 	version = (buf[SCT_STATUS_VERSION_HIGH] << 8) |
 		  buf[SCT_STATUS_VERSION_LOW];
 	if (version != 2 && version != 3)
-		goto skip_sct_status;
+		goto skip_sct;
 
-	st->have_sct_temp = buf[SCT_STATUS_TEMP] != INVALID_TEMP;
-	if (!st->have_sct_temp)
-		goto skip_sct_status;
+	have_sct_temp = buf[SCT_STATUS_TEMP] != INVALID_TEMP;
+	if (!have_sct_temp)
+		goto skip_sct;
 
 	st->have_temp_lowest = buf[SCT_STATUS_TEMP_LOWEST] != INVALID_TEMP;
 	st->have_temp_highest = buf[SCT_STATUS_TEMP_HIGHEST] != INVALID_TEMP;
 
-skip_sct_status:
 	if (!have_sct_data_table)
 		goto skip_sct;
 
@@ -292,11 +333,11 @@ skip_sct_status:
 	buf[2] = 1;	/* read table */
 	buf[4] = 2;	/* temperature history table */
 
-	err = smarttemp_ata_command(st, SMART_WRITE_LOG, SCT_STATUS_REQ);
+	err = satatemp_ata_command(st, SMART_WRITE_LOG, SCT_STATUS_REQ_ADDR);
 	if (err)
 		goto skip_sct_data;
 
-	err = smarttemp_ata_command(st, SMART_READ_LOG, 0xe1);
+	err = satatemp_ata_command(st, SMART_READ_LOG, SCT_READ_LOG_ADDR);
 	if (err)
 		goto skip_sct_data;
 
@@ -314,46 +355,19 @@ skip_sct_status:
 	st->temp_lcrit = ((s8)buf[9]) * 1000;
 
 skip_sct_data:
-	if (st->have_sct_temp)
+	if (have_sct_temp) {
+		st->get_temp = satatemp_get_scttemp;
 		return 0;
-skip_sct:
-	return smarttemp_read_smarttemp(st, &temp);
-}
-
-static int smarttemp_read_temp(struct smarttemp_data *st, u32 attr,
-			       long *val)
-{
-	u8 *buf = st->smartdata;
-	int err;
-
-	if (st->have_sct_temp) {
-		err = smarttemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ);
-		if (err)
-			return err;
-		switch (attr) {
-		case hwmon_temp_input:
-			*val = ((char)buf[SCT_STATUS_TEMP]) * 1000;
-			break;
-		case hwmon_temp_lowest:
-			*val = ((char)buf[SCT_STATUS_TEMP_LOWEST] * 1000);
-			break;
-		case hwmon_temp_highest:
-			*val = ((char)buf[SCT_STATUS_TEMP_HIGHEST]) * 1000;
-			break;
-		default:
-			err = -EINVAL;
-			break;
-		}
-		return err;
 	}
-
-	return smarttemp_read_smarttemp(st, val);
+skip_sct:
+	st->get_temp = satatemp_get_smarttemp;
+	return satatemp_get_smarttemp(st, hwmon_temp_input, &temp);
 }
 
-static int smarttemp_read(struct device *dev, enum hwmon_sensor_types type,
-			  u32 attr, int channel, long *val)
+static int satatemp_read(struct device *dev, enum hwmon_sensor_types type,
+			 u32 attr, int channel, long *val)
 {
-	struct smarttemp_data *st = dev_get_drvdata(dev);
+	struct satatemp_data *st = dev_get_drvdata(dev);
 	int err = 0;
 
 	if (type != hwmon_temp)
@@ -363,7 +377,7 @@ static int smarttemp_read(struct device *dev, enum hwmon_sensor_types type,
 	case hwmon_temp_input:
 	case hwmon_temp_lowest:
 	case hwmon_temp_highest:
-		err = smarttemp_read_temp(st, attr, val);
+		err = st->get_temp(st, attr, val);
 		break;
 	case hwmon_temp_lcrit:
 		*val = st->temp_lcrit;
@@ -384,11 +398,11 @@ static int smarttemp_read(struct device *dev, enum hwmon_sensor_types type,
 	return err;
 }
 
-static umode_t smarttemp_is_visible(const void *data,
-				    enum hwmon_sensor_types type,
-				    u32 attr, int channel)
+static umode_t satatemp_is_visible(const void *data,
+				   enum hwmon_sensor_types type,
+				   u32 attr, int channel)
 {
-	const struct smarttemp_data *st = data;
+	const struct satatemp_data *st = data;
 
 	switch (type) {
 	case hwmon_temp:
@@ -429,7 +443,7 @@ static umode_t smarttemp_is_visible(const void *data,
 	return 0;
 }
 
-static const struct hwmon_channel_info *smarttemp_info[] = {
+static const struct hwmon_channel_info *satatemp_info[] = {
 	HWMON_CHANNEL_INFO(chip,
 			   HWMON_C_REGISTER_TZ),
 	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT |
@@ -439,30 +453,25 @@ static const struct hwmon_channel_info *smarttemp_info[] = {
 	NULL
 };
 
-static const struct hwmon_ops smarttemp_ops = {
-	.is_visible = smarttemp_is_visible,
-	.read = smarttemp_read,
+static const struct hwmon_ops satatemp_ops = {
+	.is_visible = satatemp_is_visible,
+	.read = satatemp_read,
 };
 
-static const struct hwmon_chip_info smarttemp_chip_info = {
-	.ops = &smarttemp_ops,
-	.info = smarttemp_info,
+static const struct hwmon_chip_info satatemp_chip_info = {
+	.ops = &satatemp_ops,
+	.info = satatemp_info,
 };
 
 /*
  * The device argument points to sdev->sdev_dev. Its parent is
  * sdev->sdev_gendev, which we can use to get the scsi_device pointer.
  */
-static int smarttemp_add(struct device *dev, struct class_interface *intf)
+static int satatemp_add(struct device *dev, struct class_interface *intf)
 {
 	struct scsi_device *sdev = to_scsi_device(dev->parent);
-	struct smarttemp_data *st;
+	struct satatemp_data *st;
 	int err;
-
-	/* Bail out immediately if this is not an ATA device */
-	err = smarttemp_identify_ata(sdev);
-	if (err)
-		return err;
 
 	st = kzalloc(sizeof(*st), GFP_KERNEL);
 	if (!st)
@@ -471,20 +480,20 @@ static int smarttemp_add(struct device *dev, struct class_interface *intf)
 	st->sdev = sdev;
 	st->dev = dev;
 
-	if (smarttemp_identify_features(st)) {
+	if (satatemp_identify(st)) {
 		err = -ENODEV;
 		goto abort;
 	}
 
-	st->hwdev = hwmon_device_register_with_info(dev->parent, "smarttemp",
-						    st, &smarttemp_chip_info,
+	st->hwdev = hwmon_device_register_with_info(dev->parent, "satatemp",
+						    st, &satatemp_chip_info,
 						    NULL);
 	if (IS_ERR(st->hwdev)) {
 		err = PTR_ERR(st->hwdev);
 		goto abort;
 	}
 
-	list_add(&st->list, &smarttemp_devlist);
+	list_add(&st->list, &satatemp_devlist);
 	return 0;
 
 abort:
@@ -492,11 +501,11 @@ abort:
 	return err;
 }
 
-static void smarttemp_remove(struct device *dev, struct class_interface *intf)
+static void satatemp_remove(struct device *dev, struct class_interface *intf)
 {
-	struct smarttemp_data *st, *tmp;
+	struct satatemp_data *st, *tmp;
 
-	list_for_each_entry_safe(st, tmp, &smarttemp_devlist, list) {
+	list_for_each_entry_safe(st, tmp, &satatemp_devlist, list) {
 		if (st->dev == dev) {
 			list_del(&st->list);
 			hwmon_device_unregister(st->hwdev);
@@ -506,23 +515,23 @@ static void smarttemp_remove(struct device *dev, struct class_interface *intf)
 	}
 }
 
-static struct class_interface smarttemp_interface = {
-	.add_dev = smarttemp_add,
-	.remove_dev = smarttemp_remove,
+static struct class_interface satatemp_interface = {
+	.add_dev = satatemp_add,
+	.remove_dev = satatemp_remove,
 };
 
-static int __init smarttemp_init(void)
+static int __init satatemp_init(void)
 {
-	return scsi_register_interface(&smarttemp_interface);
+	return scsi_register_interface(&satatemp_interface);
 }
 
-static void __exit smarttemp_exit(void)
+static void __exit satatemp_exit(void)
 {
-	scsi_unregister_interface(&smarttemp_interface);
+	scsi_unregister_interface(&satatemp_interface);
 }
 
-module_init(smarttemp_init);
-module_exit(smarttemp_exit);
+module_init(satatemp_init);
+module_exit(satatemp_exit);
 
 MODULE_AUTHOR("Guenter Roeck <linus@roeck-us.net>");
 MODULE_DESCRIPTION("ATA temperature monitor");
