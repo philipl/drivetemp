@@ -275,12 +275,18 @@ static int satatemp_identify(struct satatemp_data *st)
 	u8 *vpd;
 	int err;
 
-	/* bail out if there is no inquiry data */
+	/* bail out immediately if there is no inquiry data */
 	if (!sdev->inquiry || sdev->inquiry_len < 16)
 		return -ENODEV;
 
-	/* sanity check: libata reports the SCSI Vendor ID as "ATA" */
-	if (strncmp(&sdev->inquiry[8], "ATA     ", 8))
+	/*
+	 * Inquiry data sanity checks (per SAT-5):
+	 * - periheral qualifier must be 0
+	 * - peripheral device type must be 0x0 (Direct access block device)
+	 * - SCSI Vendor ID is "ATA     "
+	 */
+	if (sdev->inquiry[0] ||
+	    strncmp(&sdev->inquiry[8], "ATA     ", 8))
 		return -ENODEV;
 
 	vpd = kzalloc(1024, GFP_KERNEL);
