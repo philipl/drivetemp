@@ -97,6 +97,7 @@
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <scsi/scsi_cmnd.h>
 #include <scsi/scsi_device.h>
 #include <scsi/scsi_driver.h>
@@ -104,6 +105,7 @@
 
 struct satatemp_data {
 	struct list_head list;		/* list of instantiated devices */
+	struct mutex lock;		/* protect data buffer accesses */
 	struct scsi_device *sdev;	/* SCSI device */
 	struct device *dev;		/* instantiating device */
 	struct device *hwdev;		/* hardware monitoring device */
@@ -393,7 +395,9 @@ static int satatemp_read(struct device *dev, enum hwmon_sensor_types type,
 	case hwmon_temp_input:
 	case hwmon_temp_lowest:
 	case hwmon_temp_highest:
+		mutex_lock(&st->lock);
 		err = st->get_temp(st, attr, val);
+		mutex_unlock(&st->lock);
 		break;
 	case hwmon_temp_lcrit:
 		*val = st->temp_lcrit;
@@ -495,6 +499,7 @@ static int satatemp_add(struct device *dev, struct class_interface *intf)
 
 	st->sdev = sdev;
 	st->dev = dev;
+	mutex_init(&st->lock);
 
 	if (satatemp_identify(st)) {
 		err = -ENODEV;
