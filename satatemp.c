@@ -73,9 +73,9 @@
  * Also, the second raw byte (possibly reporting the fractional temperature)
  * is currently ignored.
  *
- * Many drives also report temperature limits in additional raw bytes.
- * The format of those is not well defined and varies widely. The driver
- * does not currently attempt to report those limits.
+ * Many drives also report temperature limits in additional SMART data raw
+ * bytes. The format of those is not well defined and varies widely.
+ * The driver does not currently attempt to report those limits.
  *
  * According to data in smartmontools, attribute 231 is rarely used to report
  * drive temperatures. At the same time, several drives report SSD life left
@@ -83,9 +83,12 @@
  * attribute 231 is currently ignored.
  *
  * Following above definitions, temperatures are reported as follows.
- * - If attribute 194 is supported, it is used to read the temperature.
- * - If attribute 194 is not supported, attribute 190 is used to read the
- *   temperature if it is supported.
+ *   If SCT Command Transport is supported, it is used to read the
+ *   temperature and, if available, temperature limits.
+ * - Otherwise, if SMART attribute 194 is supported, it is used to read
+ *   the temperature.
+ * - Otherwise, if SMART attribute 190 is supported, it is used to read
+ *   the temperature.
  */
 
 #include <linux/ata.h>
