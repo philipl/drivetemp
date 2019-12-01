@@ -136,6 +136,8 @@ static LIST_HEAD(satatemp_devlist);
 
 #define INVALID_TEMP		0x80
 
+#define temp_is_valid(temp)	((temp) != INVALID_TEMP)
+
 static int satatemp_scsi_command(struct satatemp_data *st,
 				 u8 ata_command, u8 feature,
 				 u8 lba_low, u8 lba_mid, u8 lba_high)
@@ -185,10 +187,10 @@ static int satatemp_get_smarttemp(struct satatemp_data *st, u32 attr,
 {
 	u8 *buf = st->smartdata;
 	bool have_temp = false;
-	int nattrs, i;
 	u8 temp_raw;
 	u8 csum;
 	int err;
+	int i;
 
 	err = satatemp_ata_command(st, ATA_SMART_READ_VALUES, 0);
 	if (err)
@@ -204,8 +206,7 @@ static int satatemp_get_smarttemp(struct satatemp_data *st, u32 attr,
 		return -EIO;
 	}
 
-	nattrs = min_t(int, ATA_MAX_SMART_ATTRS, ATA_SECT_SIZE / 12);
-	for (i = 0; i < nattrs; i++) {
+	for (i = 0; i < ATA_MAX_SMART_ATTRS; i++) {
 		u8 *attr = buf + i * 12;
 		int id = attr[2];
 
@@ -317,12 +318,12 @@ static int satatemp_identify(struct satatemp_data *st)
 	if (version != 2 && version != 3)
 		goto skip_sct;
 
-	have_sct_temp = buf[SCT_STATUS_TEMP] != INVALID_TEMP;
+	have_sct_temp = temp_is_valid(buf[SCT_STATUS_TEMP]);
 	if (!have_sct_temp)
 		goto skip_sct;
 
-	st->have_temp_lowest = buf[SCT_STATUS_TEMP_LOWEST] != INVALID_TEMP;
-	st->have_temp_highest = buf[SCT_STATUS_TEMP_HIGHEST] != INVALID_TEMP;
+	st->have_temp_lowest = temp_is_valid(buf[SCT_STATUS_TEMP_LOWEST]);
+	st->have_temp_highest = temp_is_valid(buf[SCT_STATUS_TEMP_HIGHEST]);
 
 	if (!have_sct_data_table)
 		goto skip_sct;
@@ -341,13 +342,14 @@ static int satatemp_identify(struct satatemp_data *st)
 	if (err)
 		goto skip_sct_data;
 
-	/* Temperature limits per AT Attachment 8 -
+	/*
+	 * Temperature limits per AT Attachment 8 -
 	 * ATA/ATAPI Command Set (ATA8-ACS)
 	 */
-	st->have_temp_max = buf[6] != INVALID_TEMP;
-	st->have_temp_crit = buf[7] != INVALID_TEMP;
-	st->have_temp_min = buf[8] != INVALID_TEMP;
-	st->have_temp_lcrit = buf[9] != INVALID_TEMP;
+	st->have_temp_max = temp_is_valid(buf[6]);
+	st->have_temp_crit = temp_is_valid(buf[7]);
+	st->have_temp_min = temp_is_valid(buf[8]);
+	st->have_temp_lcrit = temp_is_valid(buf[9]);
 
 	st->temp_max = ((s8)buf[6]) * 1000;
 	st->temp_crit = ((s8)buf[7]) * 1000;
