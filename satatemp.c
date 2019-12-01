@@ -293,9 +293,13 @@ static int satatemp_identify(struct satatemp_data *st)
 		return err;
 	}
 
-	/* more sanity checks */
-	if (strncmp(&vpd[8], "linux   libata          ", 24) ||
-	    vpd[56] != ATA_CMD_ID_ATA) {
+	/*
+	 * More sanity checks.
+	 * For VPD offsets and values see ANS Project INCITS 557,
+	 * "Information technology - SCSI / ATA Translation - 5 (SAT-5)".
+	 */
+	if (vpd[1] != 0x89 || vpd[2] != 0x02 || vpd[3] != 0x38 ||
+	    vpd[36] != 0x34 || vpd[56] != ATA_CMD_ID_ATA) {
 		kfree(vpd);
 		return -ENODEV;
 	}
