@@ -140,6 +140,7 @@ static LIST_HEAD(satatemp_devlist);
 #define INVALID_TEMP		0x80
 
 #define temp_is_valid(temp)	((temp) != INVALID_TEMP)
+#define temp_from_sct(temp)	(((s8)(temp)) * 1000)
 
 static int satatemp_scsi_command(struct satatemp_data *st,
 				 u8 ata_command, u8 feature,
@@ -245,13 +246,13 @@ static int satatemp_get_scttemp(struct satatemp_data *st, u32 attr, long *val)
 		return err;
 	switch (attr) {
 	case hwmon_temp_input:
-		*val = ((char)buf[SCT_STATUS_TEMP]) * 1000;
+		*val = temp_from_sct(buf[SCT_STATUS_TEMP]);
 		break;
 	case hwmon_temp_lowest:
-		*val = ((char)buf[SCT_STATUS_TEMP_LOWEST] * 1000);
+		*val = temp_from_sct(buf[SCT_STATUS_TEMP_LOWEST]);
 		break;
 	case hwmon_temp_highest:
-		*val = ((char)buf[SCT_STATUS_TEMP_HIGHEST]) * 1000;
+		*val = temp_from_sct(buf[SCT_STATUS_TEMP_HIGHEST]);
 		break;
 	default:
 		err = -EINVAL;
@@ -354,10 +355,10 @@ static int satatemp_identify(struct satatemp_data *st)
 	st->have_temp_min = temp_is_valid(buf[8]);
 	st->have_temp_lcrit = temp_is_valid(buf[9]);
 
-	st->temp_max = ((s8)buf[6]) * 1000;
-	st->temp_crit = ((s8)buf[7]) * 1000;
-	st->temp_min = ((s8)buf[8]) * 1000;
-	st->temp_lcrit = ((s8)buf[9]) * 1000;
+	st->temp_max = temp_from_sct(buf[6]);
+	st->temp_crit = temp_from_sct(buf[7]);
+	st->temp_min = temp_from_sct(buf[8]);
+	st->temp_lcrit = temp_from_sct(buf[9]);
 
 skip_sct_data:
 	if (have_sct_temp) {
