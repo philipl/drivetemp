@@ -92,6 +92,7 @@
  */
 
 #include <linux/ata.h>
+#include <linux/bits.h>
 #include <linux/device.h>
 #include <linux/hwmon.h>
 #include <linux/kernel.h>
@@ -143,6 +144,16 @@ static LIST_HEAD(satatemp_devlist);
 
 #define temp_is_valid(temp)	((temp) != INVALID_TEMP)
 #define temp_from_sct(temp)	(((s8)(temp)) * 1000)
+
+static inline bool ata_id_smart_supported(u16 *id)
+{
+	return id[ATA_ID_COMMAND_SET_1] & BIT(0);
+}
+
+static inline bool ata_id_smart_enabled(u16 *id)
+{
+	return id[ATA_ID_CFS_ENABLE_1] & BIT(0);
+}
 
 static int satatemp_scsi_command(struct satatemp_data *st,
 				 u8 ata_command, u8 feature,
@@ -270,6 +281,7 @@ static int satatemp_identify(struct satatemp_data *st)
 	bool is_ata, is_sata;
 	bool have_sct_data_table;
 	bool have_sct_temp;
+	bool have_smart;
 	bool have_sct;
 	u16 *ata_id;
 	u16 version;
@@ -316,6 +328,8 @@ static int satatemp_identify(struct satatemp_data *st)
 	is_sata = ata_id_is_sata(ata_id);
 	have_sct = ata_id_sct_supported(ata_id);
 	have_sct_data_table = ata_id_sct_data_tables(ata_id);
+	have_smart = ata_id_smart_supported(ata_id) &&
+				ata_id_smart_enabled(ata_id);
 
 	kfree(vpd);
 
@@ -378,6 +392,8 @@ skip_sct_data:
 		return 0;
 	}
 skip_sct:
+	if (!have_smart)
+		return -ENODEV;
 	st->get_temp = satatemp_get_smarttemp;
 	return satatemp_get_smarttemp(st, hwmon_temp_input, &temp);
 }
