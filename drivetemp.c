@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Hwmon client for SATA hard disk drives with temperature sensors
- * (c) 2019 Guenter Roeck
+ * Hwmon client for disk and solid state drives with temperature sensors
+ * Copyright (C) 2019 Zodiac Inflight Innovations
  *
- * Derived from:
+ * With input from:
  *    Hwmon client for S.M.A.R.T. hard disk drives with temperature sensors.
  *    (C) 2018 Linus Walleij
  *
  *    hwmon: Driver for SCSI/ATA temperature sensors
  *    by Constantin Baranov <const@mimas.ru>, submitted September 2009
  *
- * The primary means to read hard drive temperatures and temperature limits
- * is the SCT Command Transport feature set as specified in ATA8-ACS.
+ * This drive supports reporting the temperatire of SATA drives. It can be
+ * easily extended to report the temperature of SCSI drives.
+ *
+ * The primary means to read drive temperatures and temperature limits
+ * for ATA drives is the SCT Command Transport feature set as specified in
+ * ATA8-ACS.
  * It can be used to read the current drive temperature, temperature limits,
  * and historic minimum and maximum temperatures. The SCT Command Transport
  * feature set is documented in "AT Attachment 8 - ATA/ATAPI Command Set
@@ -104,14 +108,14 @@
 #include <scsi/scsi_driver.h>
 #include <scsi/scsi_proto.h>
 
-struct satatemp_data {
+struct drivetemp_data {
 	struct list_head list;		/* list of instantiated devices */
 	struct mutex lock;		/* protect data buffer accesses */
 	struct scsi_device *sdev;	/* SCSI device */
 	struct device *dev;		/* instantiating device */
 	struct device *hwdev;		/* hardware monitoring device */
 	u8 smartdata[ATA_SECT_SIZE];	/* local buffer */
-	int (*get_temp)(struct satatemp_data *st, u32 attr, long *val);
+	int (*get_temp)(struct drivetemp_data *st, u32 attr, long *val);
 	bool have_temp_lowest;		/* lowest temp in SCT status */
 	bool have_temp_highest;		/* highest temp in SCT status */
 	bool have_temp_min;		/* have min temp */
@@ -124,7 +128,7 @@ struct satatemp_data {
 	int temp_crit;			/* critical limit */
 };
 
-static LIST_HEAD(satatemp_devlist);
+static LIST_HEAD(drivetemp_devlist);
 
 #define ATA_MAX_SMART_ATTRS	30
 #define SMART_TEMP_PROP_190	190
@@ -155,11 +159,11 @@ static inline bool ata_id_smart_enabled(u16 *id)
 	return id[ATA_ID_CFS_ENABLE_1] & BIT(0);
 }
 
-static int satatemp_scsi_command(struct satatemp_data *st,
+static int drivetemp_scsi_command(struct drivetemp_data *st,
 				 u8 ata_command, u8 feature,
 				 u8 lba_low, u8 lba_mid, u8 lba_high)
 {
-	static u8 scsi_cmd[MAX_COMMAND_SIZE];
+	u8 scsi_cmd[MAX_COMMAND_SIZE];
 	int data_dir;
 
 	memset(scsi_cmd, 0, sizeof(scsi_cmd));
@@ -193,13 +197,13 @@ static int satatemp_scsi_command(struct satatemp_data *st,
 				NULL);
 }
 
-static int satatemp_ata_command(struct satatemp_data *st, u8 feature, u8 select)
+static int drivetemp_ata_command(struct drivetemp_data *st, u8 feature, u8 select)
 {
-	return satatemp_scsi_command(st, ATA_CMD_SMART, feature, select,
+	return drivetemp_scsi_command(st, ATA_CMD_SMART, feature, select,
 				     ATA_SMART_LBAM_PASS, ATA_SMART_LBAH_PASS);
 }
 
-static int satatemp_get_smarttemp(struct satatemp_data *st, u32 attr,
+static int drivetemp_get_smarttemp(struct drivetemp_data *st, u32 attr,
 				  long *temp)
 {
 	u8 *buf = st->smartdata;
@@ -209,7 +213,7 @@ static int satatemp_get_smarttemp(struct satatemp_data *st, u32 attr,
 	int err;
 	int i;
 
-	err = satatemp_ata_command(st, ATA_SMART_READ_VALUES, 0);
+	err = drivetemp_ata_command(st, ATA_SMART_READ_VALUES, 0);
 	if (err)
 		return err;
 
@@ -249,12 +253,12 @@ static int satatemp_get_smarttemp(struct satatemp_data *st, u32 attr,
 	return -ENXIO;
 }
 
-static int satatemp_get_scttemp(struct satatemp_data *st, u32 attr, long *val)
+static int drivetemp_get_scttemp(struct drivetemp_data *st, u32 attr, long *val)
 {
 	u8 *buf = st->smartdata;
 	int err;
 
-	err = satatemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ_ADDR);
+	err = drivetemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ_ADDR);
 	if (err)
 		return err;
 	switch (attr) {
@@ -274,10 +278,11 @@ static int satatemp_get_scttemp(struct satatemp_data *st, u32 attr, long *val)
 	return err;
 }
 
-static int satatemp_identify(struct satatemp_data *st)
+static int drivetemp_identify_sata(struct drivetemp_data *st)
 {
 	struct scsi_device *sdev = st->sdev;
 	u8 *buf = st->smartdata;
+	struct scsi_vpd *vpd;
 	bool is_ata, is_sata;
 	bool have_sct_data_table;
 	bool have_sct_temp;
@@ -286,44 +291,22 @@ static int satatemp_identify(struct satatemp_data *st)
 	u16 *ata_id;
 	u16 version;
 	long temp;
-	u8 *vpd;
 	int err;
 
-	/* bail out immediately if there is no inquiry data */
-	if (!sdev->inquiry || sdev->inquiry_len < 16)
-		return -ENODEV;
+	/* SCSI-ATA Translation present? */
+	rcu_read_lock();
+	vpd = rcu_dereference(sdev->vpd_pg89);
 
 	/*
-	 * Inquiry data sanity checks (per SAT-5):
-	 * - periheral qualifier must be 0
-	 * - peripheral device type must be 0x0 (Direct access block device)
-	 * - SCSI Vendor ID is "ATA     "
+	 * Verify that ATA IDENTIFY DEVICE data is included in ATA Information
+	 * VPD and that the drive implements the SATA protocol.
 	 */
-	if (sdev->inquiry[0] ||
-	    strncmp(&sdev->inquiry[8], "ATA     ", 8))
-		return -ENODEV;
-
-	vpd = kzalloc(1024, GFP_KERNEL);
-	if (!vpd)
-		return -ENOMEM;
-
-	err = scsi_get_vpd_page(sdev, 0x89, vpd, 1024);
-	if (err) {
-		kfree(vpd);
-		return err;
-	}
-
-	/*
-	 * More sanity checks.
-	 * For VPD offsets and values see ANS Project INCITS 557,
-	 * "Information technology - SCSI / ATA Translation - 5 (SAT-5)".
-	 */
-	if (vpd[1] != 0x89 || vpd[2] != 0x02 || vpd[3] != 0x38 ||
-	    vpd[36] != 0x34 || vpd[56] != ATA_CMD_ID_ATA) {
-		kfree(vpd);
+	if (!vpd || vpd->len < 572 || vpd->data[56] != ATA_CMD_ID_ATA ||
+	    vpd->data[36] != 0x34) {
+		rcu_read_unlock();
 		return -ENODEV;
 	}
-	ata_id = (u16 *)&vpd[60];
+	ata_id = (u16 *)&vpd->data[60];
 	is_ata = ata_id_is_ata(ata_id);
 	is_sata = ata_id_is_sata(ata_id);
 	have_sct = ata_id_sct_supported(ata_id);
@@ -331,7 +314,7 @@ static int satatemp_identify(struct satatemp_data *st)
 	have_smart = ata_id_smart_supported(ata_id) &&
 				ata_id_smart_enabled(ata_id);
 
-	kfree(vpd);
+	rcu_read_unlock();
 
 	/* bail out if this is not a SATA device */
 	if (!is_ata || !is_sata)
@@ -339,7 +322,7 @@ static int satatemp_identify(struct satatemp_data *st)
 	if (!have_sct)
 		goto skip_sct;
 
-	err = satatemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ_ADDR);
+	err = drivetemp_ata_command(st, SMART_READ_LOG, SCT_STATUS_REQ_ADDR);
 	if (err)
 		goto skip_sct;
 
@@ -364,11 +347,11 @@ static int satatemp_identify(struct satatemp_data *st)
 	buf[2] = 1;	/* read table */
 	buf[4] = 2;	/* temperature history table */
 
-	err = satatemp_ata_command(st, SMART_WRITE_LOG, SCT_STATUS_REQ_ADDR);
+	err = drivetemp_ata_command(st, SMART_WRITE_LOG, SCT_STATUS_REQ_ADDR);
 	if (err)
 		goto skip_sct_data;
 
-	err = satatemp_ata_command(st, SMART_READ_LOG, SCT_READ_LOG_ADDR);
+	err = drivetemp_ata_command(st, SMART_READ_LOG, SCT_READ_LOG_ADDR);
 	if (err)
 		goto skip_sct_data;
 
@@ -388,20 +371,38 @@ static int satatemp_identify(struct satatemp_data *st)
 
 skip_sct_data:
 	if (have_sct_temp) {
-		st->get_temp = satatemp_get_scttemp;
+		st->get_temp = drivetemp_get_scttemp;
 		return 0;
 	}
 skip_sct:
 	if (!have_smart)
 		return -ENODEV;
-	st->get_temp = satatemp_get_smarttemp;
-	return satatemp_get_smarttemp(st, hwmon_temp_input, &temp);
+	st->get_temp = drivetemp_get_smarttemp;
+	return drivetemp_get_smarttemp(st, hwmon_temp_input, &temp);
 }
 
-static int satatemp_read(struct device *dev, enum hwmon_sensor_types type,
+static int drivetemp_identify(struct drivetemp_data *st)
+{
+	struct scsi_device *sdev = st->sdev;
+
+	/* Bail out immediately if there is no inquiry data */
+	if (!sdev->inquiry || sdev->inquiry_len < 16)
+		return -ENODEV;
+
+	/* Disk device? */
+	if (sdev->type != TYPE_DISK && sdev->type != TYPE_ZBC)
+		return -ENODEV;
+
+	if (!drivetemp_identify_sata(st))
+		return 0;
+
+	return -ENODEV;
+}
+
+static int drivetemp_read(struct device *dev, enum hwmon_sensor_types type,
 			 u32 attr, int channel, long *val)
 {
-	struct satatemp_data *st = dev_get_drvdata(dev);
+	struct drivetemp_data *st = dev_get_drvdata(dev);
 	int err = 0;
 
 	if (type != hwmon_temp)
@@ -434,11 +435,11 @@ static int satatemp_read(struct device *dev, enum hwmon_sensor_types type,
 	return err;
 }
 
-static umode_t satatemp_is_visible(const void *data,
+static umode_t drivetemp_is_visible(const void *data,
 				   enum hwmon_sensor_types type,
 				   u32 attr, int channel)
 {
-	const struct satatemp_data *st = data;
+	const struct drivetemp_data *st = data;
 
 	switch (type) {
 	case hwmon_temp:
@@ -479,7 +480,7 @@ static umode_t satatemp_is_visible(const void *data,
 	return 0;
 }
 
-static const struct hwmon_channel_info *satatemp_info[] = {
+static const struct hwmon_channel_info *drivetemp_info[] = {
 	HWMON_CHANNEL_INFO(chip,
 			   HWMON_C_REGISTER_TZ),
 	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT |
@@ -489,24 +490,24 @@ static const struct hwmon_channel_info *satatemp_info[] = {
 	NULL
 };
 
-static const struct hwmon_ops satatemp_ops = {
-	.is_visible = satatemp_is_visible,
-	.read = satatemp_read,
+static const struct hwmon_ops drivetemp_ops = {
+	.is_visible = drivetemp_is_visible,
+	.read = drivetemp_read,
 };
 
-static const struct hwmon_chip_info satatemp_chip_info = {
-	.ops = &satatemp_ops,
-	.info = satatemp_info,
+static const struct hwmon_chip_info drivetemp_chip_info = {
+	.ops = &drivetemp_ops,
+	.info = drivetemp_info,
 };
 
 /*
  * The device argument points to sdev->sdev_dev. Its parent is
  * sdev->sdev_gendev, which we can use to get the scsi_device pointer.
  */
-static int satatemp_add(struct device *dev, struct class_interface *intf)
+static int drivetemp_add(struct device *dev, struct class_interface *intf)
 {
 	struct scsi_device *sdev = to_scsi_device(dev->parent);
-	struct satatemp_data *st;
+	struct drivetemp_data *st;
 	int err;
 
 	st = kzalloc(sizeof(*st), GFP_KERNEL);
@@ -517,20 +518,20 @@ static int satatemp_add(struct device *dev, struct class_interface *intf)
 	st->dev = dev;
 	mutex_init(&st->lock);
 
-	if (satatemp_identify(st)) {
+	if (drivetemp_identify(st)) {
 		err = -ENODEV;
 		goto abort;
 	}
 
-	st->hwdev = hwmon_device_register_with_info(dev->parent, "satatemp",
-						    st, &satatemp_chip_info,
+	st->hwdev = hwmon_device_register_with_info(dev->parent, "drivetemp",
+						    st, &drivetemp_chip_info,
 						    NULL);
 	if (IS_ERR(st->hwdev)) {
 		err = PTR_ERR(st->hwdev);
 		goto abort;
 	}
 
-	list_add(&st->list, &satatemp_devlist);
+	list_add(&st->list, &drivetemp_devlist);
 	return 0;
 
 abort:
@@ -538,11 +539,11 @@ abort:
 	return err;
 }
 
-static void satatemp_remove(struct device *dev, struct class_interface *intf)
+static void drivetemp_remove(struct device *dev, struct class_interface *intf)
 {
-	struct satatemp_data *st, *tmp;
+	struct drivetemp_data *st, *tmp;
 
-	list_for_each_entry_safe(st, tmp, &satatemp_devlist, list) {
+	list_for_each_entry_safe(st, tmp, &drivetemp_devlist, list) {
 		if (st->dev == dev) {
 			list_del(&st->list);
 			hwmon_device_unregister(st->hwdev);
@@ -552,24 +553,24 @@ static void satatemp_remove(struct device *dev, struct class_interface *intf)
 	}
 }
 
-static struct class_interface satatemp_interface = {
-	.add_dev = satatemp_add,
-	.remove_dev = satatemp_remove,
+static struct class_interface drivetemp_interface = {
+	.add_dev = drivetemp_add,
+	.remove_dev = drivetemp_remove,
 };
 
-static int __init satatemp_init(void)
+static int __init drivetemp_init(void)
 {
-	return scsi_register_interface(&satatemp_interface);
+	return scsi_register_interface(&drivetemp_interface);
 }
 
-static void __exit satatemp_exit(void)
+static void __exit drivetemp_exit(void)
 {
-	scsi_unregister_interface(&satatemp_interface);
+	scsi_unregister_interface(&drivetemp_interface);
 }
 
-module_init(satatemp_init);
-module_exit(satatemp_exit);
+module_init(drivetemp_init);
+module_exit(drivetemp_exit);
 
 MODULE_AUTHOR("Guenter Roeck <linus@roeck-us.net>");
-MODULE_DESCRIPTION("ATA temperature monitor");
+MODULE_DESCRIPTION("Hard drive temperature monitor");
 MODULE_LICENSE("GPL");

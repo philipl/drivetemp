@@ -1,5 +1,5 @@
-Kernel driver satatemp
-======================
+Kernel driver drivetemp
+=======================
 
 
 References
@@ -18,8 +18,10 @@ Information technology - SCSI / ATA Translation - 5 (SAT-5)
 Description
 -----------
 
-This driver supports reporting the temperature of SATA drives.
-If supported, it uses the SCT Command Transport feature to read
+This driver supports reporting the temperature of disk and solid state
+drives with temperature sensors.
+
+If supported, it uses the ATA SCT Command Transport feature to read
 the current drive temperature and, if available, temperature limits
 as well as historic minimum and maximum temperatures. If SCT Command
 Transport is not supported, the driver uses SMART attributes to read
@@ -30,7 +32,7 @@ Sysfs entries
 -------------
 
 Only the temp1_input attribute is always available. Other attributes are
-available only if supported by the drive. All temperatures are reported in
+available only if reported by the drive. All temperatures are reported in
 milli-degrees Celsius.
 
 =======================	=====================================================
