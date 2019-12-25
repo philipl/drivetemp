@@ -1,6 +1,13 @@
 Kernel driver drivetemp
 =======================
 
+Usage note
+----------
+
+Must be bvuilt on top of Linux kernel v5.5 or later. Older kernels require
+upstream commit d188b0675b21 ("scsi: core: Add sysfs attributes for VPD pages
+0h and 89h") and possibly other SCSI core changes.
+
 
 References
 ----------
